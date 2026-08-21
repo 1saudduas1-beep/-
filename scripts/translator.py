@@ -31,7 +31,7 @@ DATA_DIR = Path("data")
 CHUNKS_PATH = DATA_DIR / "chunks.json"
 TRANSLATED_PATH = DATA_DIR / "translated.json"
 
-MODEL_NAME = "gemini-1.5-flash"
+MODEL_NAME = "gemini-flash-latest"
 DELAY_BETWEEN_REQUESTS_SECONDS = 4
 MAX_RETRIES_PER_CHUNK = 3
 
