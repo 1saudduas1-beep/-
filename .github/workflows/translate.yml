@@ -1,4 +1,3 @@
-
 name: Translate SRT to Bilingual Arabic
 
 on:
@@ -32,15 +31,24 @@ jobs:
       # ترجمة الأسطر عبر Gemini. إذا فشلت هذه الخطوة (مثلًا بسبب ضغط مؤقت
       # على خوادم Google أو خطأ 503)، لا نوقف الـ job فورًا؛ نكمل إلى خطوة
       # حفظ التقدم أدناه حتى لا تُفقد الترجمات المنجزة حتى نقطة الفشل.
+      # يدعم مفتاح Gemini واحد (GEMINI_API_KEY، للتوافق مع الإعداد
+      # القديم) أو عدة مفاتيح مفصولة بفواصل (GEMINI_API_KEYS) للاستفادة
+      # من تدوير المفاتيح عبر مشاريع Google منفصلة. GROQ_API_KEY اختياري
+      # كخط دفاع أخير فقط لو استُنفدت كل حصص Gemini.
       - name: Translate with Gemini
         id: translate
         continue-on-error: true
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python scripts/translator.py
 
-      # يحفظ ملفي data/translated.json و data/glossary.json داخل المستودع
-      # نفسه (رغم أنهما ضمن .gitignore عادة) حتى لو فشلت الترجمة جزئيًا.
+      # يحفظ كل ملفات تقدّم الترجمة داخل المستودع نفسه (رغم أنها ضمن
+      # .gitignore عادة) حتى لو فشلت الترجمة جزئيًا: translated.json
+      # و glossary.json للترجمات والقاموس، exhausted_quota.json حتى لا
+      # يُعاد تجربة تركيبات (مفتاح × موديل) معروف استنفادها اليوم بعد كل
+      # إعادة تشغيل، وconflicts/groq_fallback_used للشفافية عند المراجعة.
       # هذا يسمح لك بإعادة تشغيل الـ workflow يدويًا لاحقًا فيكمل تلقائيًا
       # من النافذة التي توقف عندها بدل البدء من الصفر.
       - name: Save translation progress
@@ -48,8 +56,13 @@ jobs:
         run: |
           git config user.name "translation-bot"
           git config user.email "actions@github.com"
-          if [ -f data/translated.json ] || [ -f data/glossary.json ]; then
-            git add -f data/translated.json data/glossary.json 2>/dev/null || true
+          FILES="data/translated.json data/glossary.json data/exhausted_quota.json data/translation_conflicts.json data/groq_fallback_used.json"
+          EXISTING=""
+          for f in $FILES; do
+            [ -f "$f" ] && EXISTING="$EXISTING $f"
+          done
+          if [ -n "$EXISTING" ]; then
+            git add -f $EXISTING 2>/dev/null || true
             if ! git diff --cached --quiet; then
               git commit -m "chore: save translation progress [skip ci]"
               git push
@@ -80,3 +93,17 @@ jobs:
         with:
           name: glossary
           path: data/glossary.json
+
+      # للمراجعة السريعة: أسطر تداخل تُرجمت بشكل مختلف بين نافذتين،
+      # وأسطر تُرجمت عبر خط الدفاع الأخير (Groq) بدل Gemini. الملفان قد
+      # لا يوجدا إطلاقًا في تشغيل سليم بالكامل، فالرفع اختياري (لا يفشل
+      # الـ job لو غير موجودين).
+      - name: Upload quality review files (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-review
+          path: |
+            data/translation_conflicts.json
+            data/groq_fallback_used.json
+          if-no-files-found: ignore
