@@ -6,6 +6,9 @@ translator.py
 والتحقق من تطابق عدد الأسطر المُرجعة مع عدد الأسطر المُرسلة، مع إعادة
 محاولة تلقائية (retry) عند أي خلل، وفاصل زمني بسيط بين الطلبات لتفادي
 حدود الحصة المجانية (rate limits).
+
+يستخدم مكتبة google-genai الرسمية الجديدة (وليس google-generativeai
+المتوقفة)، لأنها تتعامل بشكل صحيح مع صيغة مفاتيح API الجديدة (AQ.).
 """
 
 import json
@@ -14,7 +17,8 @@ import sys
 import time
 from pathlib import Path
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from glossary_manager import (
     load_glossary,
@@ -84,16 +88,20 @@ def extract_json(raw_text: str) -> dict:
     return json.loads(cleaned.strip())
 
 
-def translate_chunk(model, chunk: dict, glossary: dict) -> dict:
+def translate_chunk(client, chunk: dict, glossary: dict) -> dict:
     expected_indices = {seg["index"] for seg in chunk["segments"]}
     prompt = build_prompt(chunk, glossary)
 
     last_error = None
     for attempt in range(1, MAX_RETRIES_PER_CHUNK + 1):
         try:
-            response = model.generate_content(
-                prompt,
-                generation_config={"response_mime_type": "application/json"},
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTIONS,
+                    response_mime_type="application/json",
+                ),
             )
             parsed = extract_json(response.text)
 
@@ -131,11 +139,7 @@ def main() -> None:
             "GitHub Secrets وربطه في ملف الـ workflow."
         )
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        model_name=MODEL_NAME,
-        system_instruction=SYSTEM_INSTRUCTIONS,
-    )
+    client = genai.Client(api_key=api_key)
 
     chunks_data = json.loads(CHUNKS_PATH.read_text(encoding="utf-8"))
     chunks = chunks_data["chunks"]
@@ -146,7 +150,7 @@ def main() -> None:
     for chunk in chunks:
         print(f"جارٍ ترجمة النافذة {chunk['chunk_id'] + 1}/{len(chunks)}...")
 
-        result = translate_chunk(model, chunk, glossary)
+        result = translate_chunk(client, chunk, glossary)
 
         for t in result.get("translations", []):
             all_translations[t["index"]] = t["arabic"]
