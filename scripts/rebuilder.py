@@ -17,12 +17,14 @@ OUTPUT_DIR = Path("output")
 PARSED_PATH = DATA_DIR / "parsed.json"
 TRANSLATED_PATH = DATA_DIR / "translated.json"
 CONFLICTS_PATH = DATA_DIR / "translation_conflicts.json"
+GROQ_USED_PATH = DATA_DIR / "groq_fallback_used.json"
 
 # معيار احترافي شائع للترجمة المرئية: حد أقصى ~42 حرفًا للسطر، وسطرين
 # كحد أقصى لكل مقطع، وإلا يصعب قراءة السطر خلال مدة عرضه القصيرة.
 MAX_LINE_CHARS = 42
 MAX_LINES = 2
 CONFLICT_MARKER = "⚠️ "
+GROQ_MARKER = "🔄 "  # سطر تُرجم عبر خط الدفاع الأخير (Groq) بدل Gemini — يُنصح بمراجعته
 
 
 def parse_timestamp(ts: str):
@@ -64,6 +66,11 @@ def main() -> None:
         if CONFLICTS_PATH.exists()
         else {}
     )
+    groq_used = set(
+        json.loads(GROQ_USED_PATH.read_text(encoding="utf-8"))
+        if GROQ_USED_PATH.exists()
+        else []
+    )
 
     segments = parsed["segments"]
     source_name = parsed["source_file"]
@@ -84,6 +91,10 @@ def main() -> None:
                 # مختلف بين نافذتين متداخلتين، إلى جانب تفاصيله في
                 # translation_conflicts.json وسجل التشغيل.
                 arabic = CONFLICT_MARKER + arabic
+            if idx_str in groq_used:
+                # علامة لأي سطر تُرجم عبر خط الدفاع الأخير (Groq) بدل
+                # Gemini بسبب استنفاد كل الحصص — يستحق مراجعة إضافية.
+                arabic = GROQ_MARKER + arabic
 
         bilingual_content = f'{seg["content"]}\n{arabic}'
 
@@ -103,6 +114,12 @@ def main() -> None:
             f"تنبيه: {len(conflicts)} سطرًا معلَّمًا بـ {CONFLICT_MARKER.strip()} "
             f"في الملف الناتج بسبب اختلاف ترجمة في نوافذ متداخلة — "
             f"التفاصيل في {CONFLICTS_PATH}."
+        )
+    if groq_used:
+        print(
+            f"تنبيه: {len(groq_used)} سطرًا معلَّمًا بـ {GROQ_MARKER.strip()} "
+            f"في الملف الناتج لأنه تُرجم عبر خط الدفاع الأخير (Groq) بدل Gemini — "
+            f"يُنصح بمراجعتها، التفاصيل في {GROQ_USED_PATH}."
         )
 
     OUTPUT_DIR.mkdir(exist_ok=True)
