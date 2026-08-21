@@ -4,11 +4,14 @@ translator.py
 يستدعي Gemini API فعليًا لترجمة كل نافذة سياقية (chunk) إلى العربية،
 مع الالتزام بقاموس المصطلحات المعتمد، وطلب رد بصيغة JSON منظّمة فقط،
 والتحقق من تطابق عدد الأسطر المُرجعة مع عدد الأسطر المُرسلة، مع إعادة
-محاولة تلقائية (retry) عند أي خلل، وفاصل زمني بسيط بين الطلبات لتفادي
-حدود الحصة المجانية (rate limits).
+محاولة تلقائية (retry بتأخير تصاعدي) عند أي خلل أو ضغط مؤقت على خوادم
+Google (خطأ 503)، وفاصل زمني بسيط بين الطلبات لتفادي حدود الحصة المجانية.
 
 يستخدم مكتبة google-genai الرسمية الجديدة (وليس google-generativeai
 المتوقفة)، لأنها تتعامل بشكل صحيح مع صيغة مفاتيح API الجديدة (AQ.).
+
+مقاوم للانقطاع: يحفظ كل نافذة مترجمة فور نجاحها في data/translated.json،
+وعند إعادة التشغيل يتجاوز أي نافذة سبق ترجمتها بنجاح ويكمل من حيث توقف.
 """
 
 import json
@@ -33,7 +36,9 @@ TRANSLATED_PATH = DATA_DIR / "translated.json"
 
 MODEL_NAME = "gemini-flash-latest"
 DELAY_BETWEEN_REQUESTS_SECONDS = 4
-MAX_RETRIES_PER_CHUNK = 3
+MAX_RETRIES_PER_CHUNK = 5
+BACKOFF_BASE_SECONDS = 10       # التأخير يتضاعف مع كل محاولة: 10, 20, 40, 80, 160
+BACKOFF_MAX_SECONDS = 120
 
 SYSTEM_INSTRUCTIONS = """أنت مترجم طبي متخصص (medical translator). مهمتك ترجمة
 سطور من محاضرة تشريح طبية باللغة الإنجليزية إلى اللغة العربية الفصحى
@@ -62,6 +67,31 @@ SYSTEM_INSTRUCTIONS = """أنت مترجم طبي متخصص (medical translator
 5. عدد عناصر translations يجب أن يساوي بالضبط عدد الأسطر المُرسلة إليك،
    بنفس أرقام index تمامًا، بما فيها الأسطر القصيرة جدًا (مثل "Right."
    أو "Okay.") — لا تدمج سطرين معًا ولا تحذف أي سطر."""
+
+
+def load_translated() -> dict[str, str]:
+    """يحمّل الترجمات المحفوظة مسبقًا (إن وُجدت) لدعم الاستئناف بعد انقطاع."""
+    if not TRANSLATED_PATH.exists():
+        return {}
+    try:
+        return json.loads(TRANSLATED_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def save_translated(all_translations: dict[str, str]) -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    TRANSLATED_PATH.write_text(
+        json.dumps(all_translations, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def chunk_already_done(chunk: dict, all_translations: dict[str, str]) -> bool:
+    """نافذة تُعتبر منجزة إن كانت كل أسطرها موجودة مسبقًا في الترجمات."""
+    return all(
+        str(seg["index"]) in all_translations for seg in chunk["segments"]
+    )
 
 
 def build_prompt(chunk: dict, glossary: dict) -> str:
@@ -119,15 +149,20 @@ def translate_chunk(client, chunk: dict, glossary: dict) -> dict:
 
         except Exception as exc:  # noqa: BLE001 - نريد إعادة المحاولة لأي خطأ
             last_error = exc
-            print(
-                f"  [نافذة {chunk['chunk_id']}] محاولة {attempt} فشلت: {exc}. "
-                f"إعادة المحاولة..."
-            )
-            time.sleep(DELAY_BETWEEN_REQUESTS_SECONDS)
+            if attempt < MAX_RETRIES_PER_CHUNK:
+                wait = min(BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)), BACKOFF_MAX_SECONDS)
+                print(
+                    f"  [نافذة {chunk['chunk_id']}] محاولة {attempt} فشلت: {exc}. "
+                    f"إعادة المحاولة بعد {wait} ثانية..."
+                )
+                time.sleep(wait)
 
     sys.exit(
         f"فشلت ترجمة النافذة {chunk['chunk_id']} بعد {MAX_RETRIES_PER_CHUNK} "
-        f"محاولات. آخر خطأ: {last_error}"
+        f"محاولات. آخر خطأ: {last_error}\n"
+        f"الترجمات المنجزة حتى الآن محفوظة في {TRANSLATED_PATH} — "
+        f"إذا سويت الـ workflow تجيب هذه الملفات، أعد تشغيله وسيكمل تلقائيًا "
+        f"من هذه النافذة بدل البدء من الصفر."
     )
 
 
@@ -145,31 +180,36 @@ def main() -> None:
     chunks = chunks_data["chunks"]
 
     glossary = load_glossary()
-    all_translations: dict[int, str] = {}
+    all_translations = load_translated()
+
+    if all_translations:
+        print(
+            f"تم العثور على {len(all_translations)} سطرًا مترجمًا مسبقًا "
+            f"(من تشغيل سابق) — سيتم تخطي النوافذ المنجزة والاستئناف."
+        )
 
     for chunk in chunks:
+        if chunk_already_done(chunk, all_translations):
+            print(f"النافذة {chunk['chunk_id'] + 1}/{len(chunks)}: منجزة مسبقًا، تخطّي.")
+            continue
+
         print(f"جارٍ ترجمة النافذة {chunk['chunk_id'] + 1}/{len(chunks)}...")
 
         result = translate_chunk(client, chunk, glossary)
 
         for t in result.get("translations", []):
-            all_translations[t["index"]] = t["arabic"]
+            all_translations[str(t["index"])] = t["arabic"]
 
         glossary = merge_new_terms(glossary, result.get("new_terms", []))
-        save_glossary(glossary)  # حفظ تراكمي بعد كل نافذة لأمان أعلى
+
+        # حفظ فوري بعد كل نافذة ناجحة، حتى لا تُفقد الترجمات المنجزة
+        # إذا فشلت نافذة لاحقة أو انقطع التشغيل.
+        save_glossary(glossary)
+        save_translated(all_translations)
 
         time.sleep(DELAY_BETWEEN_REQUESTS_SECONDS)
 
-    TRANSLATED_PATH.write_text(
-        json.dumps(
-            {str(k): v for k, v in all_translations.items()},
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-    print(f"تمت ترجمة {len(all_translations)} مقطعًا بنجاح.")
+    print(f"تمت ترجمة {len(all_translations)} سطرًا بنجاح إجمالًا.")
     print(f"القاموس النهائي يحتوي {len(glossary)} مصطلحًا معتمدًا.")
     print(f"تم الحفظ في: {TRANSLATED_PATH}")
 
