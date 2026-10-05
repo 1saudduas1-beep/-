@@ -1,19 +1,18 @@
 """
 يستخرج أسئلة اختبار NotebookLM (رابط المشاركة) عبر Playwright إلى:
-    <base>.txt   نص مرتب يحاكي ترتيب الصفحة (سؤال EN/AR ← خيارات ← شرح كل خيار ← الإجابة)
-    <base>.json  بنية كاملة {stem:{en,ar}, options:[{letter,en,ar,status,explanation:{en,ar}}], correct}
-    <base>.html  صفحة RTL/LTR تلقائية تحاكي شكل الاختبار (مناسبة للجوال)
+    <base>.json  مخطط منظَّم (meta + questions) مع تحقق جودة لكل سؤال
+    <base>.txt   نص مرتب يحاكي ترتيب الصفحة
 
 الاستخدام: python extract_quiz.py <share_url> <base> [reveal=1|0]
-متغيرات اختيارية: QUIZ_HEADED=1 ، QUIZ_HINTS=1|0 (التقاط التلميحات، الافتراضي 1)
+متغيرات اختيارية: QUIZ_HEADED=1 ، QUIZ_HINTS=1|0 ، QUIZ_DIGITS=keep|latin (تحويل الأرقام الهندية ٠-٩ إلى 0-9)
 """
-import html as H
 import json
 import os
 import re
 import sys
 import time
 import unicodedata
+from datetime import datetime, timezone
 
 from playwright.sync_api import sync_playwright
 
@@ -73,7 +72,9 @@ JS_STATE = r"""
     for (const c of n.childNodes) s += ser(c, mark);
     if (tag === 'SUP') s = '^{' + s + '}';
     else if (tag === 'SUB') s = '_{' + s + '}';
-    return (cs.display === 'inline' || cs.display === 'contents') ? s : '\n' + s + '\n';
+    const inl = (cs.display === 'inline' || cs.display === 'contents');
+    if (!inl && n.querySelector('.katex') && s.replace(/\u0001[^\u0002]*\u0002/g, '').trim() === '') return s;
+    return inl ? s : '\n' + s + '\n';
   }
   document.querySelectorAll('[data-qopt]').forEach(e => e.removeAttribute('data-qopt'));
   const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
@@ -178,9 +179,30 @@ def prep(raw: str) -> str:
     return script_conv(s)
 
 
-def clean_line(s: str) -> str:
+_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+# قاموس تصحيحات يدوي قابل للتوسعة (كلمات تأتي مقطعة من مصدر الصفحة)
+ARABIC_FIXES = {"محلو ل": "محلول"}
+SENT_END = re.compile(r"[.؟?!:؛]$")
+
+
+def fix_text(s: str) -> str:
     s = re.sub(r"[ \t]+", " ", s).strip()
-    return re.sub(r"\s+([؟،؛])", r"\1", s)
+    s = s.replace("\u2212", "-").replace("\u2009", " ")
+    if os.environ.get("QUIZ_DIGITS", "keep") == "latin":
+        s = s.translate(_DIGITS)
+    for k, v in ARABIC_FIXES.items():
+        s = s.replace(k, v)
+    # حرف ل/ة منفصل عن كلمته عربيًا (تقطيع مصدر) → يُلصق
+    s = re.sub(r"([\u0621-\u064A]{2,})\s+([لة])(?![\u0621-\u064A])", r"\1\2", s)
+    s = re.sub(r"\s+([؟،؛.,;:!?)\]])", r"\1", s)          # لا مسافة قبل علامات الترقيم
+    s = re.sub(r"([(\[])\s+", r"\1", s)                     # ولا بعد قوس الفتح
+    s = re.sub(r"([\u0621-\u064A])(?=[A-Za-z0-9])", r"\1 ", s)  # عربي ملتصق بلاتيني/رقم
+    s = re.sub(r"([A-Za-z0-9%)\]])(?=[\u0621-\u064A])", r"\1 ", s)
+    return re.sub(r" {2,}", " ", s).strip()
+
+
+def clean_line(s: str) -> str:
+    return fix_text(s)
 
 
 def clean_lines(raw: str) -> list[str]:
@@ -193,11 +215,26 @@ def clean_lines(raw: str) -> list[str]:
     return out
 
 
+def _join(parts: list[str]) -> str:
+    out = ""
+    for p in parts:
+        out = p if not out else (out + p if re.match(r"^[؟،؛.,;:!?)\]]", p) else out + " " + p)
+    return out
+
+
 def split_bilingual(lines: list[str]) -> dict:
-    en, ar = [], []
-    for ln in lines:
-        (ar if AR_CHAR.search(ln) else en).append(ln)
-    return {"en": " ".join(en), "ar": " ".join(ar)}
+    """يوزّع الأسطر إلى en/ar؛ يدمج الشظايا اللاتينية/الرقمية القصيرة داخل جملة عربية (مثل 0.1 N HCl)."""
+    kind = ["ar" if AR_CHAR.search(l) else "en" for l in lines]
+    for i, l in enumerate(lines):
+        if kind[i] != "en" or len(l) > 40 or SENT_END.search(l) and len(l) > 25:
+            continue
+        prev_ar = i > 0 and kind[i - 1] == "ar" and not SENT_END.search(lines[i - 1])
+        next_ar = i + 1 < len(lines) and kind[i + 1] == "ar"
+        if prev_ar and (next_ar or i == len(lines) - 1):
+            kind[i] = "ar"
+    en = [l for l, k in zip(lines, kind) if k == "en"]
+    ar = [l for l, k in zip(lines, kind) if k == "ar"]
+    return {"en": _join(en), "ar": _join(ar)}
 
 
 def extra_lines(pre: list[str], post: list[str]) -> list[str]:
@@ -342,47 +379,55 @@ def render_txt(questions: list[dict]) -> str:
     return "\n".join(out)
 
 
-HTML_CSS = """
-:root{--bg:#f6f7fb;--card:#fff;--tx:#1b1f2a;--mut:#667;--ok:#18794e;--okb:#e6f6ee;--bad:#b42318;--badb:#fdecea;--bd:#dde1ea}
-@media(prefers-color-scheme:dark){:root{--bg:#12141a;--card:#1c2029;--tx:#e8eaf0;--mut:#9aa3b2;--ok:#5fd39b;--okb:#12301f;--bad:#ff8a80;--badb:#3a1a18;--bd:#2c3240}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.6 "Noto Naskh Arabic","Segoe UI",Tahoma,Roboto,sans-serif}
-main{max-width:760px;margin:0 auto;padding:12px}h1{font-size:1.1rem;margin:8px 0}
-.bar{position:sticky;top:0;background:var(--bg);padding:8px 0;z-index:2}button{font:inherit;padding:6px 12px;border:1px solid var(--bd);border-radius:8px;background:var(--card);color:var(--tx)}
-.q{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:14px;margin:12px 0}
-.n{color:var(--mut);font-size:.85rem}.en,.ar{margin:2px 0}.stem .en,.stem .ar{font-weight:600}
-.opt{border:1px solid var(--bd);border-radius:10px;padding:8px 10px;margin:8px 0;display:flex;gap:10px}
-.L{font-weight:700;min-width:1.4em}.opt .body{flex:1}.ex{color:var(--mut);font-size:.9rem;margin-top:4px}
-.hint{background:var(--badb);border-radius:8px;padding:6px 10px;font-size:.9rem;display:none}
-body.show .opt.correct{border-color:var(--ok);background:var(--okb)}body.show .opt.wrong{border-color:var(--bad);background:var(--badb)}
-.ex,.tag,.hint{display:none}body.show .ex,body.show .tag{display:block}body.show .hint{display:block}
-.tag{font-size:.8rem;font-weight:700}.correct .tag{color:var(--ok)}.wrong .tag{color:var(--bad)}
-"""
-
-
-def render_html(questions: list[dict], title: str) -> str:
-    e = lambda s: H.escape(s or "")
-    p = lambda cls, s: f'<div class="{cls}" dir="auto">{e(s)}</div>' if s else ""
-    body = []
+def build_json(questions: list[dict], url: str, base: str, reveal: bool) -> dict:
+    out, warn_total = [], 0
     for q in questions:
-        b = [f'<section class="q"><div class="n">{q.get("number")} / {q.get("total")}</div>',
-             f'<div class="stem">{p("en", q["stem"]["en"])}{p("ar", q["stem"]["ar"])}</div>']
-        if q.get("hint"):
-            b.append(f'<div class="hint">{p("en", q["hint"]["en"])}{p("ar", q["hint"]["ar"])}</div>')
+        opts, w = [], []
         for o in q.get("options", []):
-            tag = {"correct": "✓ الإجابة الصحيحة", "wrong": "✗ إجابة غير صحيحة"}.get(o["status"], "")
-            b.append(f'<div class="opt {o["status"]}"><div class="L">{e(o["letter"])}.</div><div class="body">'
-                     f'{p("en", o["en"])}{p("ar", o["ar"])}'
-                     + (f'<div class="tag" dir="auto">{tag}</div>' if tag else "")
-                     + (f'<div class="ex">{p("en", o["explanation"]["en"])}{p("ar", o["explanation"]["ar"])}</div>'
-                        if o["explanation"]["en"] or o["explanation"]["ar"] else "")
-                     + "</div></div>")
-        b.append("</section>")
-        body.append("".join(b))
-    return (f'<!doctype html><html lang="ar"><head><meta charset="utf-8">'
-            f'<meta name="viewport" content="width=device-width,initial-scale=1"><title>{e(title)}</title>'
-            f"<style>{HTML_CSS}</style></head><body><main><div class=\"bar\"><h1 dir=\"auto\">{e(title)}</h1>"
-            f"<button onclick=\"document.body.classList.toggle('show')\">إظهار / إخفاء الإجابات والشرح</button></div>"
-            + "".join(body) + "</main></body></html>")
+            opts.append({"key": o["letter"],
+                         "text": {"en": o["en"], "ar": o["ar"]},
+                         "is_correct": o["letter"] in q.get("correct", []),
+                         "explanation": o["explanation"]})
+        keys = q.get("correct", [])
+        ans = [o for o in opts if o["is_correct"]]
+        if len(opts) < 2:
+            w.append("options_lt_2")
+        if reveal and not keys:
+            w.append("no_correct_answer")
+        if len(keys) > 1:
+            w.append("multiple_correct")
+        if not q["stem"]["en"] and not q["stem"]["ar"]:
+            w.append("empty_question")
+        if (q["stem"]["ar"] == "") != all(o["text"]["ar"] == "" for o in opts) and q["stem"]["ar"] == "":
+            w.append("question_missing_ar")
+        for o in opts:
+            if q["stem"]["ar"] and not o["text"]["ar"] and AR_CHAR.search(o["text"]["en"]) is None \
+                    and not re.fullmatch(r"[\d\s.,%+\-–×/^()<>=a-zA-Z²³¹⁰-⁹µ°]+", o["text"]["en"]):
+                w.append(f"option_{o['key']}_missing_ar")
+            if re.search(r"(?<![\u0621-\u064A])[\u0621-\u064A](?![\u0621-\u064A])",
+                         o["text"]["ar"].replace("و", "")):
+                w.append(f"option_{o['key']}_lone_arabic_letter")
+        if reveal and opts and any(not (o["explanation"]["en"] or o["explanation"]["ar"]) for o in opts):
+            w.append("missing_explanation")
+        warn_total += len(w)
+        out.append({
+            "id": f"q{int(q.get('number') or 0):03d}",
+            "number": q.get("number"),
+            "question": q["stem"],
+            "hint": q.get("hint") or {"en": "", "ar": ""},
+            "options": opts,
+            "answer": {"keys": keys,
+                       "text": ans[0]["text"] if len(ans) == 1 else {"en": "", "ar": ""},
+                       "explanation": ans[0]["explanation"] if len(ans) == 1 else {"en": "", "ar": ""}},
+            "warnings": w,
+        })
+    total = questions[0].get("total") if questions else None
+    return {"meta": {"schema_version": "2.0", "title": base, "source_url": url,
+                     "extracted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                     "total_declared": total, "total_extracted": len(questions),
+                     "answers_revealed": reveal, "languages": ["en", "ar"],
+                     "warnings_count": warn_total},
+            "questions": out}
 
 
 # ───────────────────────── التصفح ─────────────────────────
@@ -521,11 +566,13 @@ def main():
         print(f"::warning::التُقط {len(questions)} من {total} سؤالًا فقط.")
     with open(f"{base}.txt", "w", encoding="utf-8") as f:
         f.write(render_txt(questions))
+    data = build_json(questions, url, base, reveal)
     with open(f"{base}.json", "w", encoding="utf-8") as f:
-        json.dump(questions, f, ensure_ascii=False, indent=2)
-    with open(f"{base}.html", "w", encoding="utf-8") as f:
-        f.write(render_html(questions, base))
-    print(f"Done. {len(questions)} questions -> {base}.txt / {base}.json / {base}.html")
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    wc = data["meta"]["warnings_count"]
+    if wc:
+        print(f"::warning::{wc} ملاحظة جودة في JSON (راجع warnings لكل سؤال).")
+    print(f"Done. {len(questions)} questions -> {base}.txt / {base}.json")
 
 
 if __name__ == "__main__":
