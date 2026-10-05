@@ -2,7 +2,7 @@ name: Extract NotebookLM Quiz
 
 # ضع هذا الملف في .github/workflows/extract-quiz.yml
 # وضع extract_quiz.py في جذر المستودع.
-# المخرجات (Artifact): <name>.txt و <name>.json و <name>.html (و debug_quiz.png/.txt عند الفشل).
+# المخرجات (Artifact): <name>.txt و <name>.json (و debug_quiz.png/.txt عند الفشل).
 
 on:
   workflow_dispatch:
@@ -82,7 +82,6 @@ jobs:
           path: |
             ${{ env.SAFE_NAME }}.txt
             ${{ env.SAFE_NAME }}.json
-            ${{ env.SAFE_NAME }}.html
             debug_quiz.png
             debug_quiz.txt
           retention-days: 14
