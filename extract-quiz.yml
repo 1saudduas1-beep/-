@@ -1,0 +1,83 @@
+name: Extract NotebookLM Quiz
+
+# ضع هذا الملف في .github/workflows/extract-quiz.yml
+# وضع extract_quiz.py في جذر المستودع.
+# المخرجات (Artifact): <name>.txt و <name>.json (و debug_quiz.png/.txt عند الفشل).
+
+on:
+  workflow_dispatch:
+    inputs:
+      share_url:
+        description: 'رابط مشاركة اختبار NotebookLM'
+        required: true
+        type: string
+      base_name:
+        description: 'اسم ملف الإخراج (اختياري)'
+        required: false
+        default: 'quiz'
+        type: string
+      reveal_answers:
+        description: 'كشف الإجابات الصحيحة والشرح (ينقر أول خيار في كل سؤال)'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SHARE_URL: ${{ github.event.inputs.share_url }}
+      BASE_NAME: ${{ github.event.inputs.base_name }}
+      REVEAL: ${{ github.event.inputs.reveal_answers }}
+
+    steps:
+      - name: Normalize inputs
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          raw = os.environ.get("BASE_NAME", "")
+          name = "".join(c if (c.isalnum() or c == "-") else "_" for c in raw.strip())
+          name = re.sub(r"_+", "_", name).strip("_-")[:80].strip("_-") or "quiz"
+          url = os.environ.get("SHARE_URL", "").strip()
+          if not url or re.search(r"\s", url) or not re.match(r"^https://([A-Za-z0-9-]+\.)+google(\.com)?([/?#]|$)", url):
+              print("::error::share_url must be a single https Google/NotebookLM link.")
+              sys.exit(1)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"SAFE_NAME={name}\nCLEAN_URL={url}\n")
+          PY
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright
+        run: |
+          pip install "playwright>=1.40,<2"
+          playwright install --with-deps chromium
+
+      - name: Extract quiz
+        run: |
+          R=1; [[ "$REVEAL" == "false" ]] && R=0
+          python extract_quiz.py "$CLEAN_URL" "$SAFE_NAME" "$R"
+          echo "----- $SAFE_NAME.txt -----"
+          cat "$SAFE_NAME.txt"
+
+      - name: Upload quiz artifact
+        if: ${{ !cancelled() && env.SAFE_NAME != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SAFE_NAME }}
+          path: |
+            ${{ env.SAFE_NAME }}.txt
+            ${{ env.SAFE_NAME }}.json
+            debug_quiz.png
+            debug_quiz.txt
+          retention-days: 14
