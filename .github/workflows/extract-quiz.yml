@@ -64,9 +64,13 @@ jobs:
           playwright install --with-deps chromium
 
       - name: Extract quiz
+        env:
+          QUIZ_HEADED: '1'
+          PYTHONUNBUFFERED: '1'
         run: |
-          R=1; [[ "$REVEAL" == "false" ]] && R=0
-          python extract_quiz.py "$CLEAN_URL" "$SAFE_NAME" "$R"
+          R=1
+          if [[ "$REVEAL" == "false" ]]; then R=0; fi
+          xvfb-run -a --server-args="-screen 0 1280x1600x24" python extract_quiz.py "$CLEAN_URL" "$SAFE_NAME" "$R"
           echo "----- $SAFE_NAME.txt -----"
           cat "$SAFE_NAME.txt"
 
