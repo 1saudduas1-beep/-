@@ -6,7 +6,8 @@
 
 يُنتج: <output_base>.txt و <output_base>.json
 reveal=1: ينقر أول خيار في كل سؤال لإظهار الإجابة الصحيحة/الشرح ثم يلتقطها.
-عند الفشل: debug_quiz.png و debug_quiz.txt.
+عند الفشل: debug_quiz.png و debug_quiz.txt (يتضمن الرابط النهائي وكل الإطارات frames).
+متغيرات بيئة اختيارية: QUIZ_HEADED=1 (تشغيل بمتصفح غير مخفي، يُستحسن مع xvfb-run).
 """
 import json
 import os
@@ -68,6 +69,25 @@ JS_COUNTER_EXISTS = r"""
 """
 
 
+COUNTER_SPLIT = re.compile(r"(?m)^[ \t]*(\d+)\s*/\s*(\d+)[ \t]*$")
+JS_BODY = "document.body ? (document.body.innerText || '') : ''"
+JS_QUIZ_PRESENT = r"""
+() => {
+  const t = document.body ? (document.body.innerText || '') : '';
+  return /(?:^|\n)\s*\d+\s*\/\s*\d+\s*(?:\n|$)/.test(t);
+}
+"""
+OVERLAY_BUTTONS = [
+    r"^\s*(Accept all|I agree|Agree|Reject all|Got it|Dismiss|No thanks)\s*$",
+    r"^\s*(Start|Start quiz|Take quiz|Begin|Get started|Let'?s go)\s*$",
+]
+
+
+def norm(text: str) -> str:
+    """يوحّد العدّاد لو جاء مقسومًا على عدة أسطر (1 / / 10) إلى سطر واحد."""
+    return COUNTER_SPLIT.sub(r"\1 / \2", text or "")
+
+
 def clean_lines(text: str) -> list[str]:
     out = []
     for ln in (text or "").splitlines():
@@ -108,7 +128,13 @@ def parse_option(raw: str):
 
 
 def read_state(page):
-    return page.evaluate(JS_STATE)
+    st = page.evaluate(JS_STATE)
+    st["text"] = norm(st.get("text", ""))
+    return st
+
+
+def body_text(page) -> str:
+    return norm(page.evaluate(JS_BODY))
 
 
 def capture_question(page, reveal: bool) -> dict:
@@ -170,12 +196,58 @@ def render_txt(questions: list[dict]) -> str:
     return "\n".join(out)
 
 
+def dismiss_overlays(page):
+    """يغلق نوافذ الموافقة ويضغط زر البدء إن وُجد، في كل الإطارات."""
+    for fr in list(page.frames):
+        for pat in OVERLAY_BUTTONS:
+            try:
+                btn = fr.get_by_role("button", name=re.compile(pat, re.I))
+                if btn.count() > 0 and btn.first.is_visible():
+                    btn.first.click(timeout=2000)
+                    time.sleep(1.0)
+            except Exception:
+                pass
+
+
+def find_quiz_frame(page):
+    """يبحث عن الإطار (الصفحة الرئيسية أو iframe) الذي يحوي عدّاد الأسئلة."""
+    for fr in list(page.frames):
+        try:
+            if fr.evaluate(JS_QUIZ_PRESENT):
+                return fr
+        except Exception:
+            continue
+    return None
+
+
+def wait_for_quiz(page, timeout_s=120):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if "accounts.google.com" in page.url:
+            return None
+        dismiss_overlays(page)
+        fr = find_quiz_frame(page)
+        if fr:
+            return fr
+        time.sleep(2)
+    return None
+
+
 def debug_dump(page, why: str):
     print(f"::error::{why}")
     try:
         page.screenshot(path="debug_quiz.png", full_page=True)
+    except Exception:
+        pass
+    try:
         with open("debug_quiz.txt", "w", encoding="utf-8") as f:
-            f.write(page.evaluate("document.body.innerText || ''"))
+            f.write(f"URL: {page.url}\nTITLE: {page.title()}\n")
+            for i, fr in enumerate(page.frames):
+                f.write(f"\n===== frame {i}: {fr.url} =====\n")
+                try:
+                    f.write(fr.evaluate(JS_BODY))
+                except Exception as e:
+                    f.write(f"(تعذّرت القراءة: {type(e).__name__})")
     except Exception:
         pass
 
@@ -187,33 +259,51 @@ def main():
     url, base = sys.argv[1], sys.argv[2]
     reveal = (sys.argv[3] if len(sys.argv) == 4 else "1") not in ("0", "false", "False")
 
+    headed = os.environ.get("QUIZ_HEADED") == "1"
+    ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx = browser.new_context(viewport={"width": 1100, "height": 1300}, locale="en-US")
+        browser = p.chromium.launch(
+            headless=not headed,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
+        opts = {"viewport": {"width": 1100, "height": 1300}, "locale": "en-US",
+                "timezone_id": "America/New_York"}
+        if not headed:
+            opts["user_agent"] = ua
+        ctx = browser.new_context(**opts)
+        ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         page = ctx.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=90000)
         try:
-            page.wait_for_function(JS_COUNTER_EXISTS, timeout=90000)
-        except Exception:
-            debug_dump(page, "لم تظهر صفحة الاختبار (عدّاد الأسئلة). قد يتطلب الرابط تسجيل دخول أو تغيّرت الواجهة.")
+            page.goto(url, wait_until="domcontentloaded", timeout=90000)
+        except Exception as e:
+            print(f"::warning::تحذير أثناء التحميل: {type(e).__name__}")
+
+        fr = wait_for_quiz(page, 120)
+        if fr is None:
+            if "accounts.google.com" in page.url:
+                debug_dump(page, "تمت إعادة التوجيه إلى تسجيل دخول Google؛ الرابط غير متاح للزائر المجهول من هذا الخادم.")
+            else:
+                debug_dump(page, "لم تظهر صفحة الاختبار (عدّاد الأسئلة). راجع debug_quiz.png و debug_quiz.txt في الـ Artifact.")
             sys.exit(1)
         time.sleep(1.5)
 
         # ابدأ من السؤال الأول
         for _ in range(60):
-            cnt = parse_counter(page.evaluate("document.body.innerText || ''"))
+            cnt = parse_counter(body_text(fr))
             if not cnt or cnt[0] <= 1:
                 break
-            if not click_button(page, r"^\s*Previous\s*$"):
+            if not click_button(fr, r"^\s*Previous\s*$"):
                 break
             try:
-                page.wait_for_function(JS_COUNTER_CHANGED, arg=cnt[0], timeout=8000)
+                fr.wait_for_function(JS_COUNTER_CHANGED, arg=cnt[0], timeout=8000)
             except Exception:
                 break
 
         questions, seen = [], set()
         while True:
-            q = capture_question(page, reveal)
+            q = capture_question(fr, reveal)
             n, total = q.get("number"), q.get("total")
             if n in seen:
                 break
@@ -223,10 +313,10 @@ def main():
             if not n or not total or n >= total:
                 break
             try:
-                if not click_button(page, r"^\s*Next\s*$"):
+                if not click_button(fr, r"^\s*Next\s*$"):
                     print("::warning::لم يُعثر على زر Next؛ توقّف عند هذا السؤال.")
                     break
-                page.wait_for_function(JS_COUNTER_CHANGED, arg=n, timeout=10000)
+                fr.wait_for_function(JS_COUNTER_CHANGED, arg=n, timeout=10000)
                 time.sleep(0.6)
             except Exception:
                 print("::warning::لم ينتقل الاختبار للسؤال التالي؛ تم الاكتفاء بما التُقط.")
