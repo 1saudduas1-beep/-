@@ -114,26 +114,8 @@ def clean(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-def bilingual(text: str):
-    """يفصل 'عربي (English)' → (ar, en) بالاعتماد على آخر مجموعة أقواس في نهاية النص."""
-    s = text.strip()
-    if not s:
-        return "", ""
-    if not AR.search(s):
-        return "", s
-    if s.endswith(")"):
-        d = 0
-        for i in range(len(s) - 1, -1, -1):
-            d += (s[i] == ")") - (s[i] == "(")
-            if d == 0:
-                inner, head = s[i + 1:-1].strip(), s[:i].strip()
-                if head and AR.search(head) and len(re.findall(r"[A-Za-z]", inner)) >= 2 and not AR.search(inner):
-                    return head, inner
-                break
-    return s, ""
-
-
 def split_colon(text: str):
+    """يفصل «عنوان: وصف» عند أول نقطتين رأسيتين خارج الأقواس."""
     d = 0
     for i, ch in enumerate(text):
         d += (ch == "(") - (ch == ")")
@@ -142,13 +124,80 @@ def split_colon(text: str):
     return text.strip(), ""
 
 
+def _lang(s: str) -> str:
+    return "ar" if len(AR.findall(s)) > len(re.findall(r"[A-Za-z]", s)) else "en"
+
+
+def _top_groups(s: str):
+    out, d, st = [], 0, 0
+    for i, ch in enumerate(s):
+        if ch == "(":
+            if d == 0:
+                st = i
+            d += 1
+        elif ch == ")" and d > 0:
+            d -= 1
+            if d == 0:
+                out.append((st, i))
+    return out
+
+
+def _primary(s: str) -> str:
+    """لغة النص الأساسي = لغة ما هو خارج الأقواس (الأقواس = الترجمة)."""
+    out = s
+    for a, b in reversed(_top_groups(s)):
+        out = out[:a] + " " + out[b + 1:]
+    return _lang(out) if re.search(r"[A-Za-z\u0600-\u06FF]", out) else ("en" if _lang(s) == "ar" else "ar")
+
+
+def _trail(p: str, prim: str):
+    """يفصل المجموعة الأخيرة بين قوسين إن كانت ترجمة (لغتها غير الأساسية وتنتهي بها الجملة)."""
+    p = p.strip()
+    g = _top_groups(p)
+    if not g or g[-1][1] != len(p) - 1:
+        return p, ""
+    a, b = g[-1]
+    head, inner = p[:a].strip(), p[a + 1:b].strip()
+    if not head or not inner or _lang(inner) == prim:
+        return p, ""
+    if _lang(inner) == "ar":
+        ok = len(AR.findall(inner)) >= 2
+    else:  # مصطلح لاتيني داخل نص عربي مثل (II) أو (IIa) ليس ترجمة؛ الترجمة أطول
+        ok = len(re.findall(r"[A-Za-z]", inner)) >= 6 or len(inner.split()) >= 2
+    return (head, inner) if ok else (p, "")
+
+
+def _place(main: str, tr: str) -> dict:
+    if not main and not tr:
+        return {"ar": "", "en": ""}
+    ml = _lang(main) if re.search(r"[A-Za-z\u0600-\u06FF]", main) else ("ar" if _lang(tr) == "en" else "en")
+    return {ml: main, ("ar" if ml == "en" else "en"): tr}
+
+
+def parse_label(text: str) -> dict:
+    """
+    يدعم الصيغتين: «English (عربي): desc (عربي)» و«عربي (English): وصف (English)»،
+    والترجمة الموحّدة «Title: desc (عنوان: وصف)». الأقواس الأخيرة = ترجمة الجملة التي قبلها.
+    """
+    prim = _primary(text)
+    ttl, desc = split_colon(text)
+    t_main, t_tr = _trail(ttl, prim)
+    d_main, d_tr = _trail(desc, prim) if desc else ("", "")
+    if desc and not t_tr and d_tr:
+        a, b = split_colon(d_tr)
+        if b:
+            t_tr, d_tr = a, b
+    return {"primary": prim, "title": _place(t_main, t_tr), "desc": _place(d_main, d_tr)}
+
+
 def mk(text: str, depth: int) -> dict:
     text = clean(text)
-    ttl, desc = split_colon(text)
-    t = dict(zip(("ar", "en"), bilingual(ttl)))
-    d = dict(zip(("ar", "en"), bilingual(desc))) if desc else {"ar": "", "en": ""}
+    r = parse_label(text)
+    t, d = r["title"], r["desc"]
     join = lambda k: ": ".join(x for x in (t[k], d[k]) if x)
-    return {"id": "", "depth": depth, "text": text, "ar": join("ar"), "en": join("en"), "title": t, "desc": d}
+    ar, en = join("ar"), join("en")
+    return {"id": "", "depth": depth, "text": text, "primary": r["primary"], "ar": ar, "en": en,
+            "bilingual": bool(ar and en), "title": t, "desc": d}
 
 
 # ───────────────────────── الاستراتيجية 1: الشبكة ─────────────────────────
@@ -473,12 +522,28 @@ def finalize(root):
 def render_txt(root):
     out = []
 
+    def line(n, k):
+        return ": ".join(x for x in (n["title"][k], n["desc"][k]) if x)
+
     def go(n):
-        out.append("  " * n["depth"] + "- " + n["text"])
+        pad = "  " * n["depth"]
+        en, ar = line(n, "en"), line(n, "ar")
+        out.append(f"{pad}- {en or ar or n['text']}")
+        if en and ar:
+            out.append(f"{pad}  ↳ {ar}")
         for c in n["children"]:
             go(c)
     go(root)
     return "\n".join(out) + "\n"
+
+
+def quality(nodes):
+    bi = sum(1 for n in nodes if n["bilingual"])
+    return {"bilingual_nodes": bi, "ar_only": sum(1 for n in nodes if n["ar"] and not n["en"]),
+            "en_only": sum(1 for n in nodes if n["en"] and not n["ar"]),
+            "primary_en": sum(1 for n in nodes if n["primary"] == "en"),
+            "primary_ar": sum(1 for n in nodes if n["primary"] == "ar"),
+            "untranslated_ids": [n["id"] for n in nodes if not n["bilingual"]][:60]}
 
 
 def dismiss_overlays(page):
@@ -615,14 +680,15 @@ def main():
     nodes = finalize(result)
     meta = {"title": title, "source_url": url, "method": method, "extracted_at": datetime.now(timezone.utc).isoformat(),
             "node_count": len(nodes), "leaf_count": sum(1 for n in nodes if n["is_leaf"]),
-            "max_depth": max(n["depth"] for n in nodes), "warnings": warns}
+            "max_depth": max(n["depth"] for n in nodes), "quality": quality(nodes), "warnings": warns}
     if method == "network":
         meta["network_source"] = net_url.split("?")[0][:200]
     with open(f"{base}.json", "w", encoding="utf-8") as f:
         json.dump({"schema": "mindmap-1.0", "meta": meta, "root": result, "nodes": nodes}, f, ensure_ascii=False, indent=2)
     with open(f"{base}.txt", "w", encoding="utf-8") as f:
         f.write(render_txt(result))
-    print(f"OK: {len(nodes)} عقدة، أقصى عمق {meta['max_depth']}، الطريقة: {method}")
+    q = meta["quality"]
+    print(f"OK: {len(nodes)} عقدة، أقصى عمق {meta['max_depth']}، الطريقة: {method}، ثنائية اللغة: {q['bilingual_nodes']}")
 
 
 if __name__ == "__main__":
