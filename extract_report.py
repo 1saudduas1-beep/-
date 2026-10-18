@@ -1,7 +1,6 @@
 """
 يستخرج محتوى «التقرير» (Report / Briefing / Study guide) من رابط مشاركة NotebookLM عبر Playwright إلى:
     <base>.json  مخطط منظَّم بكتل (meta + outline + blocks) جاهز للعرض لاحقاً في تطبيق HTML
-    <base>.txt   نص Markdown مرتب (عناوين، قوائم، جداول، كتل code للرسوم النصية بالأسهم)
 
 الاستراتيجيات (يُختار الأدق تلقائياً):
   1) dom     : تحديد حاوية التقرير (أصغر عنصر يضم >=85% من النص)، التمرير لتحميل المحتوى الكسول،
@@ -250,7 +249,7 @@ JS_SERIALIZE = r"""
     const tag=el.tagName.toUpperCase();
     const ls=getComputedStyle(el).listStyleType||'';
     let ordered=tag==='OL'||/(decimal|alpha|roman|arabic|persian|hebrew)/.test(ls);
-    const kids=[...el.children].filter(c=>!skip(c)&&(c.tagName==='LI'||c.getAttribute('role')==='listitem'));
+    const kids=[...el.querySelectorAll('li,[role=listitem]')].filter(c=>!skip(c)&&c.closest('ul,ol,[role=list]')===el);
     const items=kids.map(liContent);
     return {type:'list',ordered,start:ordered?(parseInt(el.getAttribute('start')||'1')||1):1,items:items.map(i=>({t:i.t,m:i.m,children:i.children,extra:i.extra}))};
   }
@@ -761,16 +760,40 @@ def merge_snapshots(snaps: list) -> list:
 class Sniffer:
     def __init__(self):
         self.bodies = []
+        self.failed = []
 
     def __call__(self, r):
         try:
             if r.request.resource_type in ("image", "font", "media", "stylesheet"):
                 return
-            body = r.text()
+            try:
+                body = r.text()
+            except Exception:
+                body = r.body().decode("utf-8", "replace")
             if 200 < len(body) < 12_000_000:
                 self.bodies.append((r.url, body))
         except Exception:
-            pass
+            try:
+                if "batchexecute" in r.url or r.request.resource_type in ("xhr", "fetch"):
+                    self.failed.append(r.request)
+            except Exception:
+                pass
+
+    def replay(self, ctx):
+        """يعيد طلب استجابات تعذّر التقاط جسمها (يحدث أحياناً مع batchexecute)."""
+        n = 0
+        for req in self.failed[:8]:
+            try:
+                hd = {k: v for k, v in req.headers.items()
+                      if not k.startswith(":") and k.lower() not in ("content-length", "host", "cookie")}
+                resp = ctx.request.fetch(req.url, method=req.method, headers=hd, data=req.post_data, timeout=60000)
+                body = resp.text()
+                if 200 < len(body) < 12_000_000:
+                    self.bodies.append((req.url, body))
+                    n += 1
+            except Exception:
+                continue
+        return n
 
 
 def _strings(x, out, depth=0):
@@ -989,6 +1012,8 @@ def main():
                 warns.append(f"فشل استخراج DOM: {type(e).__name__}: {e}")
         if strategy in ("auto", "network"):
             md_text, md_url = find_markdown(sniff.bodies)
+            if not md_text and sniff.failed and sniff.replay(ctx):
+                md_text, md_url = find_markdown(sniff.bodies)
             if md_text:
                 try:
                     md_blocks = build_blocks_from_md(md_text)
@@ -1050,8 +1075,6 @@ def main():
     with open(f"{base}.json", "w", encoding="utf-8") as f:
         json.dump({"schema": "report-1.0", "meta": meta, "outline": outline, "blocks": blocks},
                   f, ensure_ascii=False, indent=2)
-    with open(f"{base}.txt", "w", encoding="utf-8") as f:
-        f.write(render_md(blocks))
     bc = st["block_counts"]
     print(f"OK: {len(blocks)} كتلة ({', '.join(f'{k}={v}' for k, v in sorted(bc.items()))})، "
           f"{meta['headings']} عنوان، الطريقة: {method}، {st['chars']} حرف")
