@@ -104,8 +104,7 @@ jobs:
           PYTHONUNBUFFERED: '1'
         run: |
           xvfb-run -a --server-args="-screen 0 1280x1000x24" python extract_report.py "$CLEAN_URL" "$SAFE_NAME"
-          echo "----- $SAFE_NAME.txt -----"
-          cat "$SAFE_NAME.txt"
+          ls -la "$SAFE_NAME.json"
 
       - name: Upload artifact
         if: ${{ !cancelled() && env.SAFE_NAME != '' }}
