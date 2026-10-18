@@ -1,7 +1,7 @@
-name: Extract NotebookLM (Quiz / Mind Map)
+name: Extract NotebookLM (Quiz / Mind Map / Report)
 
 # ضع هذا الملف في .github/workflows/extract-notebooklm.yml (يحلّ محل extract-quiz.yml)
-# وضع extract_quiz.py و extract_mindmap.py في جذر المستودع.
+# وضع extract_quiz.py و extract_mindmap.py و extract_report.py في جذر المستودع.
 # المخرجات (Artifact): <name>.txt و <name>.json (و debug_* عند الفشل أو التحذير).
 
 on:
@@ -15,8 +15,9 @@ on:
         options:
           - quiz
           - mindmap
+          - report
       share_url:
-        description: 'رابط مشاركة NotebookLM (اختبار أو خريطة ذهنية)'
+        description: 'رابط مشاركة NotebookLM (اختبار أو خريطة ذهنية أو تقرير)'
         required: true
         type: string
       base_name:
@@ -95,6 +96,17 @@ jobs:
           echo "----- $SAFE_NAME.txt -----"
           cat "$SAFE_NAME.txt"
 
+      - name: Extract report
+        if: ${{ env.KIND == 'report' }}
+        env:
+          RPT_HEADED: '1'
+          RPT_DEBUG: '1'
+          PYTHONUNBUFFERED: '1'
+        run: |
+          xvfb-run -a --server-args="-screen 0 1280x1000x24" python extract_report.py "$CLEAN_URL" "$SAFE_NAME"
+          echo "----- $SAFE_NAME.txt -----"
+          cat "$SAFE_NAME.txt"
+
       - name: Upload artifact
         if: ${{ !cancelled() && env.SAFE_NAME != '' }}
         uses: actions/upload-artifact@v4
@@ -108,5 +120,8 @@ jobs:
             debug_mindmap.png
             debug_mindmap.txt
             debug_mindmap.html
+            debug_report.png
+            debug_report.txt
+            debug_report.html
           if-no-files-found: ignore
           retention-days: 14
