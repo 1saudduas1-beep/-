@@ -390,7 +390,8 @@ def md_inline(s: str):
     t = re.sub(r"\*\*(.+?)\*\*", r"\1", t)
     t = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"\1", t)
     t = re.sub(r"`([^`]+)`", r"\1", t)
-    return t, md
+    t = t.replace("*", "")  # نجوم يتيمة/غير متوازنة في المصدر
+    return re.sub(r"\s+", " ", t).strip(), md
 
 
 def split_row(ln: str):
@@ -456,6 +457,15 @@ def md_to_blocks(text: str) -> list:
                     break
             ind = min((len(x) - len(x.lstrip()) for x in buf if x.strip()), default=0)
             out.append({"type": "code", "text": "\n".join(x[ind:] for x in buf).rstrip(), "lang": "diagram"})
+            i = j
+            continue
+        if s.startswith(">"):
+            flush()
+            j, qb = i, []
+            while j < n and lines[j].strip().startswith(">"):
+                qb.append(re.sub(r"^\s*>\s?", "", lines[j]))
+                j += 1
+            out.append({"type": "quote", "blocks": md_to_blocks("\n".join(qb))})
             i = j
             continue
         m = re.match(r"^(#{1,6})\s+(.*)$", s)
@@ -599,6 +609,13 @@ def norm_block(b: dict) -> list:
         if not tx.strip():
             return []
         return [{"type": "code", "text": tx, "lang": b.get("lang") or ("diagram" if BOX.search(tx) else "")}]
+    if t == "quote" and b.get("blocks") is not None:
+        kids = []
+        for c in b["blocks"]:
+            kids.extend(norm_block(c))
+        kids = post_process(kids)
+        tx = all_text(kids)
+        return [{"type": "quote", "text": tx, "md": render_md(kids).strip("\n"), "blocks": kids, **lang_info(tx)}] if tx else []
     if t == "quote":
         tx = clean(b["text"], keep_nl=True)
         return [{"type": "quote", "text": tx, "md": clean(b.get("md", ""), keep_nl=True) or tx, **lang_info(tx)}] if tx else []
@@ -996,6 +1013,9 @@ def main():
                        json.dumps(info, ensure_ascii=False))
             sys.exit(1)
 
+        hr_n = sum(1 for b in blocks if b["type"] == "hr")
+        if hr_n and os.environ.get("RPT_HR", "drop") != "keep":
+            blocks = [b for b in blocks if b["type"] != "hr"]
         # فحوصات الجودة
         st = stats(blocks)
         if not any(b["type"] == "heading" for b in blocks):
@@ -1019,6 +1039,8 @@ def main():
     langs = lang_info(all_text(blocks))
     meta = {"title": ttl, "source_url": url, "method": method,
             "extracted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "page_title": re.sub(r"^\s*Gemini Notebook\s*[-–]\s*", "", title or "").strip(),
+            "hr_dropped": hr_n if os.environ.get("RPT_HR", "drop") != "keep" else 0,
             "primary_dir": langs["dir"], "primary_lang": langs["lang"], **st, "headings": len(outline),
             "warnings": warns}
     if method == "network":
